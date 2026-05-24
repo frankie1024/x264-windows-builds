@@ -1,0 +1,209 @@
+name: Build x264 Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream x264 ref, for example stable, master, or a commit. Empty means stable."
+        required: false
+        type: string
+      force:
+        description: "Rebuild and replace release assets if the GitHub release already exists."
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "23 2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: x264-windows-${{ github.event.inputs.ref || 'stable' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-release:
+    name: Resolve upstream ref
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      upstream_ref: ${{ steps.release.outputs.upstream_ref }}
+      commit: ${{ steps.release.outputs.commit }}
+      short_commit: ${{ steps.release.outputs.short_commit }}
+      source_url: ${{ steps.release.outputs.source_url }}
+      should_build: ${{ steps.release.outputs.should_build }}
+      release_exists: ${{ steps.release.outputs.release_exists }}
+    steps:
+      - name: Resolve target ref
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+
+          upstream_ref="${INPUT_REF:-stable}"
+          commit="$(git ls-remote https://code.videolan.org/videolan/x264.git "$upstream_ref" | awk 'NR == 1 { print $1 }')"
+
+          if [ -z "$commit" ]; then
+            commit="$(git ls-remote https://code.videolan.org/videolan/x264.git "refs/heads/$upstream_ref" "refs/tags/$upstream_ref" | awk 'NR == 1 { print $1 }')"
+          fi
+
+          if [ -z "$commit" ] && printf '%s' "$upstream_ref" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
+            commit="$upstream_ref"
+          fi
+
+          if [ -z "$commit" ]; then
+            echo "Could not resolve upstream x264 ref: $upstream_ref" >&2
+            exit 1
+          fi
+
+          short_commit="$(printf '%s' "$commit" | cut -c1-12)"
+          date_part="$(date -u +%Y%m%d)"
+          tag="stable-${date_part}-${short_commit}"
+          source_url="https://code.videolan.org/videolan/x264/-/commit/${commit}"
+
+          release_exists=false
+          should_build=true
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            release_exists=true
+            if [ "${FORCE:-false}" != "true" ]; then
+              should_build=false
+            fi
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "upstream_ref=$upstream_ref"
+            echo "commit=$commit"
+            echo "short_commit=$short_commit"
+            echo "source_url=$source_url"
+            echo "release_exists=$release_exists"
+            echo "should_build=$should_build"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Upstream ref: $upstream_ref"
+          echo "Upstream commit: $commit"
+          echo "Release tag: $tag"
+          echo "Release exists: $release_exists"
+          echo "Should build: $should_build"
+
+  build-windows:
+    name: Build Windows x64 package
+    needs: resolve-release
+    if: needs.resolve-release.outputs.should_build == 'true'
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout automation repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            diffutils
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-pkgconf
+
+      - name: Clone x264 source
+        env:
+          COMMIT: ${{ needs.resolve-release.outputs.commit }}
+        run: |
+          git clone https://code.videolan.org/videolan/x264.git x264
+          cd x264
+          git checkout "$COMMIT"
+          git rev-parse HEAD > ../x264-commit.txt
+
+      - name: Build x264
+        working-directory: x264
+        run: |
+          ./configure \
+            --host=x86_64-w64-mingw32 \
+            --enable-static \
+            --disable-opencl \
+            --disable-lavf \
+            --disable-ffms \
+            --disable-gpac \
+            --disable-lsmash
+          make -j"$(nproc)"
+
+      - name: Package binaries
+        env:
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+          UPSTREAM_REF: ${{ needs.resolve-release.outputs.upstream_ref }}
+          SOURCE_URL: ${{ needs.resolve-release.outputs.source_url }}
+        run: |
+          set -euo pipefail
+
+          test -f x264/x264.exe
+
+          commit="$(tr -d '\r\n' < x264-commit.txt)"
+          package_root="artifacts/x264-${TAG}-windows-x64"
+          mkdir -p "$package_root"
+          cp x264/x264.exe "$package_root/"
+
+          cat > "$package_root/BUILD_INFO.txt" <<EOF
+          x264 Windows x64 build
+          Upstream ref: ${UPSTREAM_REF}
+          Upstream commit: ${commit}
+          Upstream source: ${SOURCE_URL}
+          Build OS: windows-2022
+          Build environment: MSYS2 MINGW64
+          Build command: ./configure --host=x86_64-w64-mingw32 --enable-static --disable-opencl --disable-lavf --disable-ffms --disable-gpac --disable-lsmash && make
+          Built at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          powershell.exe -NoLogo -NoProfile -Command "Compress-Archive -Path '${package_root}/*' -DestinationPath 'x264-${TAG}-windows-x64.zip' -Force"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x264-${{ needs.resolve-release.outputs.tag }}-windows-x64
+          path: x264-${{ needs.resolve-release.outputs.tag }}-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+          SOURCE_URL: ${{ needs.resolve-release.outputs.source_url }}
+          RELEASE_EXISTS: ${{ needs.resolve-release.outputs.release_exists }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $asset = "x264-$env:TAG-windows-x64.zip"
+          $notes = @"
+          Automated Windows x64 build of official x264 stable snapshot $env:TAG.
+
+          Upstream source: $env:SOURCE_URL
+
+          Contents include x264.exe and BUILD_INFO.txt.
+          "@
+
+          if ($env:RELEASE_EXISTS -eq "true") {
+            gh release upload $env:TAG $asset --clobber
+          } else {
+            gh release create $env:TAG $asset --title "x264 $env:TAG Windows x64" --notes $notes
+          }
+
+  already-built:
+    name: Already built
+    needs: resolve-release
+    if: needs.resolve-release.outputs.should_build != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report skipped build
+        run: |
+          echo "GitHub release ${{ needs.resolve-release.outputs.tag }} already exists. Use workflow_dispatch force=true to rebuild."
