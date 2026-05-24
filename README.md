@@ -13,6 +13,9 @@ The generated release tag format is:
 stable-YYYYMMDD-<short-sha>
 ```
 
+The `YYYYMMDD` part comes from the upstream commit date, so the same commit
+always maps to the same release version.
+
 ## Output
 
 Each GitHub release contains:
@@ -23,7 +26,7 @@ Each GitHub release contains:
 The packaged archive name is:
 
 ```text
-x264-<tag>-windows-x64.zip
+x264-<version>-x64.zip
 ```
 
 ## Manual Build

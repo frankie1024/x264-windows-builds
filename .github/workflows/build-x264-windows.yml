@@ -61,8 +61,16 @@ jobs:
           fi
 
           short_commit="$(printf '%s' "$commit" | cut -c1-12)"
-          date_part="$(date -u +%Y%m%d)"
-          tag="stable-${date_part}-${short_commit}"
+          commit_date="$(curl --fail --silent --show-error \
+            "https://code.videolan.org/api/v4/projects/videolan%2Fx264/repository/commits/${commit}" \
+            | jq -r '.committed_date | split("T")[0] | gsub("-"; "")')"
+
+          if [ -z "$commit_date" ] || [ "$commit_date" = "null" ]; then
+            echo "Could not resolve upstream x264 commit date for: $commit" >&2
+            exit 1
+          fi
+
+          tag="stable-${commit_date}-${short_commit}"
           source_url="https://code.videolan.org/videolan/x264/-/commit/${commit}"
 
           release_exists=false
@@ -87,6 +95,7 @@ jobs:
 
           echo "Upstream ref: $upstream_ref"
           echo "Upstream commit: $commit"
+          echo "Commit date: $commit_date"
           echo "Release tag: $tag"
           echo "Release exists: $release_exists"
           echo "Should build: $should_build"
@@ -149,7 +158,7 @@ jobs:
           test -f x264/x264.exe
 
           commit="$(tr -d '\r\n' < x264-commit.txt)"
-          package_root="artifacts/x264-${TAG}-windows-x64"
+          package_root="artifacts/x264-${TAG}-x64"
           mkdir -p "$package_root"
           cp x264/x264.exe "$package_root/"
 
@@ -164,13 +173,13 @@ jobs:
           Built at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
           EOF
 
-          powershell.exe -NoLogo -NoProfile -Command "Compress-Archive -Path '${package_root}/*' -DestinationPath 'x264-${TAG}-windows-x64.zip' -Force"
+          powershell.exe -NoLogo -NoProfile -Command "Compress-Archive -Path '${package_root}/*' -DestinationPath 'x264-${TAG}-x64.zip' -Force"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: x264-${{ needs.resolve-release.outputs.tag }}-windows-x64
-          path: x264-${{ needs.resolve-release.outputs.tag }}-windows-x64.zip
+          name: x264-${{ needs.resolve-release.outputs.tag }}-x64
+          path: x264-${{ needs.resolve-release.outputs.tag }}-x64.zip
           if-no-files-found: error
 
       - name: Publish GitHub release
@@ -183,7 +192,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $asset = "x264-$env:TAG-windows-x64.zip"
+          $asset = "x264-$env:TAG-x64.zip"
           $notes = @"
           Automated Windows x64 build of official x264 stable snapshot $env:TAG.
 
